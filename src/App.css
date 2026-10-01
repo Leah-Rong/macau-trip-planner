@@ -936,17 +936,11 @@ aside section {
 
 .leg-mode-switch {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-
-  width: min(100%, 250px);
-
-  margin: 0 auto;
-
+  grid-template-columns: repeat(3, 1fr);
+  width: 100%;
   padding: 3px;
-
   border: 1px solid #e4e7ec;
   border-radius: 10px;
-
   background: #f8f9fb;
 }
 
@@ -984,5 +978,100 @@ aside section {
   .leg-mode-button {
     padding: 7px 4px;
     font-size: 11px;
+  }
+}
+
+/* ========================================
+   云端共享同步状态
+======================================== */
+
+.sync-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 12px 18px 0;
+  padding: 11px 14px;
+  border: 1px solid #d0d5dd;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.sync-panel.synced {
+  background: #f6fbf7;
+  border-color: #b7dfc0;
+}
+
+.sync-panel.saving,
+.sync-panel.loading {
+  background: #f8f9ff;
+  border-color: #cdd5f5;
+}
+
+.sync-panel.migration {
+  background: #fff9ed;
+  border-color: #f2d18a;
+}
+
+.sync-panel.error {
+  background: #fff1f1;
+  border-color: #f3b7b7;
+}
+
+.sync-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sync-copy strong {
+  color: #101828;
+  font-size: 13px;
+}
+
+.sync-copy span {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.sync-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.sync-actions button {
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+/* 步行 / 开车只保留两列，并缩窄整体比例 */
+.leg-mode-switch {
+  grid-template-columns: repeat(2, 1fr);
+  width: min(100%, 240px);
+  margin: 0 auto;
+}
+
+.leg-mode-button {
+  padding: 7px 12px;
+}
+
+@media (max-width: 600px) {
+  .sync-panel {
+    align-items: stretch;
+    flex-direction: column;
+    margin: 10px 10px 0;
+  }
+
+  .sync-actions {
+    justify-content: flex-start;
+  }
+
+  .sync-actions button {
+    flex: 1 1 140px;
   }
 }

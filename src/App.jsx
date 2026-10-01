@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { loadAMap, serviceCall, convertPlaces } from './amap'
+import { getSharedTrip, saveSharedTrip } from './supabase'
 import './App.css'
 
 const colors = {
@@ -8,16 +9,9 @@ const colors = {
   '可以去': '#43a047',
 }
 
-const routeColors = [
-  '#2563eb',
-  '#7c3aed',
-  '#0891b2',
-  '#d97706',
-  '#db2777',
-  '#059669',
-]
-
 const UNSCHEDULED = '__unscheduled__'
+const DEFAULT_SHARED_TRIP_ID = 'macau-2026'
+const CLOUD_POLL_MS = 10000
 
 const itineraryTransportModes = {
   walking: '步行',
@@ -216,9 +210,110 @@ function formatMinutes(time) {
   return Math.max(1, Math.ceil(value / 60))
 }
 
+
+function readShareConfig() {
+  const rawHash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash
+
+  const params = new URLSearchParams(rawHash)
+
+  return {
+    tripId: params.get('trip')?.trim() || DEFAULT_SHARED_TRIP_ID,
+    shareToken: params.get('key')?.trim() || '',
+  }
+}
+
+function hasStoredLocalPlan() {
+  try {
+    const raw = localStorage.getItem('macauPlaces')
+    if (!raw) return false
+
+    const parsed = JSON.parse(raw)
+    return validPlaces(parsed) && parsed.length > 0
+  } catch {
+    return false
+  }
+}
+
+function normalizeSharedPlan(data) {
+  const raw = data && typeof data === 'object' && !Array.isArray(data)
+    ? data
+    : {}
+
+  const sharedPlaces = validPlaces(raw.places)
+    ? raw.places.map(normalizePlace)
+    : []
+
+  const sharedOrder = raw.itineraryOrder
+    && typeof raw.itineraryOrder === 'object'
+    && !Array.isArray(raw.itineraryOrder)
+    ? raw.itineraryOrder
+    : {}
+
+  const rawModes = raw.itineraryLegModes
+    || raw.transportModes
+    || {}
+
+  const sharedModes = rawModes
+    && typeof rawModes === 'object'
+    && !Array.isArray(rawModes)
+    ? Object.fromEntries(
+        Object.entries(rawModes)
+          .filter(([, mode]) => itineraryTransportModes[mode])
+      )
+    : {}
+
+  return {
+    version: 4,
+    places: sharedPlaces,
+    itineraryOrder: sharedOrder,
+    itineraryLegModes: sharedModes,
+  }
+}
+
+function buildSharedPlan(places, itineraryOrder, itineraryLegModes) {
+  return {
+    version: 4,
+    places,
+    itineraryOrder,
+    itineraryLegModes,
+    // 兼容之前初始化数据库时使用的字段名
+    transportModes: itineraryLegModes,
+  }
+}
+
+function sharedPlanSnapshot(plan) {
+  const normalized = normalizeSharedPlan(plan)
+  return JSON.stringify(normalized)
+}
+
+function sharedPlanHasContent(plan) {
+  const normalized = normalizeSharedPlan(plan)
+
+  return (
+    normalized.places.length > 0
+    || Object.keys(normalized.itineraryOrder).length > 0
+    || Object.keys(normalized.itineraryLegModes).length > 0
+  )
+}
+
+function formatCloudTime(value) {
+  if (!value) return ''
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+
+  return new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(date)
+}
+
 function downloadPlan(places, itineraryOrder, itineraryLegModes) {
   const data = {
-    version: 3,
+    version: 4,
     exportedAt: new Date().toISOString(),
     places,
     itineraryOrder,
@@ -240,24 +335,56 @@ function App() {
   const container = useRef(null)
   const mapRef = useRef(null)
   const engine = useRef(null)
-  const routeLayers = useRef([])
-  const routeVersion = useRef(0)
   const itineraryCalcVersion = useRef(0)
   const fileInput = useRef(null)
+
+  const shareConfigRef = useRef(readShareConfig())
+  const localPlanAtStartupRef = useRef({
+    places: readPlaces(),
+    itineraryOrder: readItineraryOrder(),
+    itineraryLegModes: readItineraryLegModes(),
+    hasStoredPlan: hasStoredLocalPlan(),
+  })
 
   const initialItineraryRouteCache = useRef(readItineraryRouteCache())
   const itineraryRouteCacheRef = useRef(initialItineraryRouteCache.current)
 
+  const cloudSaveTimerRef = useRef(null)
+  const cloudPendingSaveRef = useRef(null)
+  const cloudSavingRef = useRef(false)
+  const cloudLastSnapshotRef = useRef('')
+  const cloudLastUpdatedAtRef = useRef('')
+  const currentSharedPlanRef = useRef(
+    buildSharedPlan(
+      localPlanAtStartupRef.current.places,
+      localPlanAtStartupRef.current.itineraryOrder,
+      localPlanAtStartupRef.current.itineraryLegModes
+    )
+  )
+
+  const { tripId, shareToken } = shareConfigRef.current
+
   const [page, setPage] = useState('map')
-  const [places, setPlaces] = useState(readPlaces)
-  const [itineraryOrder, setItineraryOrder] = useState(readItineraryOrder)
-  const [itineraryLegModes, setItineraryLegModes] = useState(readItineraryLegModes)
+  const [places, setPlaces] = useState(localPlanAtStartupRef.current.places)
+  const [itineraryOrder, setItineraryOrder] = useState(
+    localPlanAtStartupRef.current.itineraryOrder
+  )
+  const [itineraryLegModes, setItineraryLegModes] = useState(
+    localPlanAtStartupRef.current.itineraryLegModes
+  )
   const [itineraryRouteCache, setItineraryRouteCache] = useState(
     initialItineraryRouteCache.current
   )
   const [activeItineraryDate, setActiveItineraryDate] = useState('all')
   const [itineraryBusy, setItineraryBusy] = useState(false)
   const [itineraryError, setItineraryError] = useState('')
+
+  const [cloudReady, setCloudReady] = useState(false)
+  const [cloudStatus, setCloudStatus] = useState(shareToken ? 'loading' : 'local')
+  const [cloudError, setCloudError] = useState('')
+  const [cloudUpdatedAt, setCloudUpdatedAt] = useState('')
+  const [migrationNeeded, setMigrationNeeded] = useState(false)
+  const [shareCopied, setShareCopied] = useState(false)
 
   const [ready, setReady] = useState(false)
   const [mapError, setMapError] = useState('')
@@ -266,13 +393,6 @@ function App() {
   const [searchBusy, setSearchBusy] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [draft, setDraft] = useState(null)
-
-  const [start, setStart] = useState('')
-  const [end, setEnd] = useState('')
-  const [mode, setMode] = useState('walking')
-  const [routes, setRoutes] = useState([])
-  const [routeBusy, setRouteBusy] = useState(false)
-  const [routeError, setRouteError] = useState('')
 
   const scheduledDates = Array.from(
     new Set(places.map(place => place.tripDate).filter(Boolean))
@@ -306,6 +426,202 @@ function App() {
       return `${group.key}:${ids}:${modes}`
     })
     .join('|')
+
+  async function applyCloudPlan(rawPlan, updatedAt = '') {
+    const normalized = normalizeSharedPlan(rawPlan)
+
+    const convertedPlaces = engine.current
+      ? await convertPlaces(engine.current, normalized.places)
+      : normalized.places
+
+    const nextPlan = buildSharedPlan(
+      convertedPlaces.map(normalizePlace),
+      normalized.itineraryOrder,
+      normalized.itineraryLegModes
+    )
+
+    cloudLastSnapshotRef.current = sharedPlanSnapshot(nextPlan)
+    cloudLastUpdatedAtRef.current = updatedAt || ''
+    currentSharedPlanRef.current = nextPlan
+
+    setPlaces(nextPlan.places)
+    setItineraryOrder(nextPlan.itineraryOrder)
+    setItineraryLegModes(nextPlan.itineraryLegModes)
+    setCloudUpdatedAt(updatedAt || '')
+  }
+
+  async function fetchCloudPlan({ initial = false } = {}) {
+    if (!shareToken) return null
+
+    const result = await getSharedTrip(tripId, shareToken)
+    const rawPlan = result?.data || {}
+    const updatedAt = result?.updated_at || ''
+    const normalized = normalizeSharedPlan(rawPlan)
+
+    if (
+      initial
+      && !sharedPlanHasContent(normalized)
+      && localPlanAtStartupRef.current.hasStoredPlan
+    ) {
+      setMigrationNeeded(true)
+      setCloudReady(false)
+      setCloudStatus('migration')
+      setCloudUpdatedAt(updatedAt)
+      cloudLastUpdatedAtRef.current = updatedAt
+      return result
+    }
+
+    await applyCloudPlan(normalized, updatedAt)
+    setMigrationNeeded(false)
+    setCloudReady(true)
+    setCloudStatus('synced')
+    setCloudError('')
+
+    return result
+  }
+
+  async function flushCloudSaveQueue() {
+    if (cloudSavingRef.current || !shareToken || !cloudReady || migrationNeeded) {
+      return
+    }
+
+    cloudSavingRef.current = true
+
+    try {
+      while (cloudPendingSaveRef.current) {
+        const item = cloudPendingSaveRef.current
+        cloudPendingSaveRef.current = null
+
+        setCloudStatus('saving')
+        setCloudError('')
+
+        const result = await saveSharedTrip(
+          tripId,
+          shareToken,
+          item.plan
+        )
+
+        cloudLastSnapshotRef.current = item.snapshot
+        cloudLastUpdatedAtRef.current = result?.updated_at || ''
+        setCloudUpdatedAt(result?.updated_at || '')
+      }
+
+      setCloudStatus('synced')
+    } catch (error) {
+      setCloudStatus('error')
+      setCloudError(error.message || '云端保存失败。')
+    } finally {
+      cloudSavingRef.current = false
+
+      if (cloudPendingSaveRef.current) {
+        void flushCloudSaveQueue()
+      }
+    }
+  }
+
+  async function uploadLocalPlanToCloud() {
+    if (!shareToken) return
+
+    const plan = buildSharedPlan(
+      places,
+      itineraryOrder,
+      itineraryLegModes
+    )
+
+    setCloudStatus('saving')
+    setCloudError('')
+
+    try {
+      const result = await saveSharedTrip(tripId, shareToken, plan)
+
+      cloudLastSnapshotRef.current = sharedPlanSnapshot(plan)
+      cloudLastUpdatedAtRef.current = result?.updated_at || ''
+      currentSharedPlanRef.current = plan
+
+      setCloudUpdatedAt(result?.updated_at || '')
+      setMigrationNeeded(false)
+      setCloudReady(true)
+      setCloudStatus('synced')
+    } catch (error) {
+      setCloudStatus('error')
+      setCloudError(error.message || '本机行程上传失败。')
+    }
+  }
+
+  async function copyShareLink() {
+    if (!shareToken) return
+
+    const link = `${window.location.origin}${window.location.pathname}#trip=${encodeURIComponent(tripId)}&key=${encodeURIComponent(shareToken)}`
+
+    try {
+      await navigator.clipboard.writeText(link)
+      setShareCopied(true)
+      window.setTimeout(() => setShareCopied(false), 1800)
+    } catch {
+      window.prompt('复制下面的分享链接：', link)
+    }
+  }
+
+  function renderSyncPanel() {
+    let title = '本机模式'
+    let detail = '当前地址没有分享码，只会使用这个浏览器里的本地数据。'
+    let className = 'sync-panel local'
+
+    if (shareToken) {
+      className = `sync-panel ${cloudStatus}`
+
+      if (cloudStatus === 'loading') {
+        title = '正在连接共享行程…'
+        detail = '正在从云端读取最新数据。'
+      } else if (cloudStatus === 'migration') {
+        title = '发现本机已有行程'
+        detail = '云端目前是空的。先把这台电脑现有的行程上传一次。'
+      } else if (cloudStatus === 'saving') {
+        title = '正在同步到云端…'
+        detail = '请保持页面打开，保存完成后手机和电脑会读取同一份数据。'
+      } else if (cloudStatus === 'error') {
+        title = '云端同步失败'
+        detail = cloudError || '请检查分享链接和 Supabase 配置。'
+      } else if (cloudStatus === 'synced') {
+        title = '云端已同步'
+        const timeText = formatCloudTime(cloudUpdatedAt)
+        detail = timeText
+          ? `最后同步：${timeText}。另一台设备通常会在约 10 秒内更新。`
+          : '电脑和手机正在使用同一份共享行程。'
+      }
+    }
+
+    return (
+      <div className={className}>
+        <div className="sync-copy">
+          <strong>{title}</strong>
+          <span>{detail}</span>
+        </div>
+
+        <div className="sync-actions">
+          {migrationNeeded && shareToken && (
+            <button
+              type="button"
+              onClick={uploadLocalPlanToCloud}
+              disabled={cloudStatus === 'saving'}
+            >
+              上传本机行程
+            </button>
+          )}
+
+          {shareToken && (
+            <button
+              type="button"
+              className="secondary"
+              onClick={copyShareLink}
+            >
+              {shareCopied ? '已复制' : '复制分享链接'}
+            </button>
+          )}
+        </div>
+      </div>
+    )
+  }
 
   useEffect(() => {
     let disposed = false
@@ -356,14 +672,172 @@ function App() {
 
     return () => {
       disposed = true
-      routeVersion.current++
       itineraryCalcVersion.current++
-      routeLayers.current.forEach(layer => map?.remove(layer.overlays))
-      routeLayers.current = []
+      window.clearTimeout(cloudSaveTimerRef.current)
+      cloudPendingSaveRef.current = null
       map?.destroy()
       mapRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    if (!ready) return undefined
+
+    if (!shareToken) {
+      setCloudStatus('local')
+      setCloudReady(false)
+      return undefined
+    }
+
+    let cancelled = false
+
+    async function load() {
+      setCloudStatus('loading')
+      setCloudError('')
+
+      try {
+        await fetchCloudPlan({ initial: true })
+      } catch (error) {
+        if (cancelled) return
+        setCloudReady(false)
+        setCloudStatus('error')
+        setCloudError(
+          error.message
+          || '无法读取共享行程。请确认分享链接没有缺少字符。'
+        )
+      }
+    }
+
+    void load()
+
+    return () => {
+      cancelled = true
+    }
+  }, [ready, tripId, shareToken])
+
+  useEffect(() => {
+    const plan = buildSharedPlan(
+      places,
+      itineraryOrder,
+      itineraryLegModes
+    )
+
+    currentSharedPlanRef.current = plan
+
+    if (!shareToken || !cloudReady || migrationNeeded) {
+      return undefined
+    }
+
+    const snapshot = sharedPlanSnapshot(plan)
+
+    if (snapshot === cloudLastSnapshotRef.current) {
+      return undefined
+    }
+
+    setCloudStatus('saving')
+
+    window.clearTimeout(cloudSaveTimerRef.current)
+
+    cloudSaveTimerRef.current = window.setTimeout(() => {
+      cloudPendingSaveRef.current = {
+        plan,
+        snapshot,
+      }
+
+      void flushCloudSaveQueue()
+    }, 700)
+
+    return () => {
+      window.clearTimeout(cloudSaveTimerRef.current)
+    }
+  }, [
+    places,
+    itineraryOrder,
+    itineraryLegModes,
+    cloudReady,
+    migrationNeeded,
+    shareToken,
+    tripId,
+  ])
+
+  useEffect(() => {
+    if (!shareToken || !cloudReady || migrationNeeded) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    async function pullLatest() {
+      if (
+        cancelled
+        || cloudSavingRef.current
+        || cloudPendingSaveRef.current
+      ) {
+        return
+      }
+
+      try {
+        const result = await getSharedTrip(tripId, shareToken)
+        if (cancelled) return
+
+        const updatedAt = result?.updated_at || ''
+
+        if (
+          updatedAt
+          && updatedAt === cloudLastUpdatedAtRef.current
+        ) {
+          return
+        }
+
+        const remotePlan = normalizeSharedPlan(result?.data || {})
+        const remoteSnapshot = sharedPlanSnapshot(remotePlan)
+        const localSnapshot = sharedPlanSnapshot(currentSharedPlanRef.current)
+
+        if (localSnapshot !== cloudLastSnapshotRef.current) {
+          return
+        }
+
+        if (remoteSnapshot !== localSnapshot) {
+          await applyCloudPlan(remotePlan, updatedAt)
+        } else {
+          cloudLastUpdatedAtRef.current = updatedAt
+          setCloudUpdatedAt(updatedAt)
+        }
+
+        if (!cancelled) {
+          setCloudStatus('synced')
+          setCloudError('')
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setCloudStatus('error')
+          setCloudError(error.message || '检查云端更新失败。')
+        }
+      }
+    }
+
+    const intervalId = window.setInterval(pullLatest, CLOUD_POLL_MS)
+
+    function handleFocus() {
+      void pullLatest()
+    }
+
+    function handleVisibility() {
+      if (document.visibilityState === 'visible') {
+        void pullLatest()
+      }
+    }
+
+    window.addEventListener('focus', handleFocus)
+    document.addEventListener('visibilitychange', handleVisibility)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+      window.removeEventListener('focus', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [shareToken, tripId, cloudReady, migrationNeeded])
 
   useEffect(() => {
     if (!ready) return
@@ -771,164 +1245,10 @@ function App() {
     void calculateTransportForGroups(visibleItineraryGroups, true)
   }
 
-  async function queryRoute() {
-    const startPlace = places.find(place => String(place.id) === start)
-    const endPlace = places.find(place => String(place.id) === end)
-
-    if (!startPlace || !endPlace) {
-      setRouteError('请先选择起点和终点。')
-      return
-    }
-
-    if (start === end) {
-      setRouteError('起点和终点需要是不同地点。')
-      return
-    }
-
-    setRouteError('')
-    setRouteBusy(true)
-    const version = ++routeVersion.current
-
-    try {
-      const AMap = engine.current
-      const service = mode === 'walking'
-        ? new AMap.Walking()
-        : new AMap.Driving()
-
-      const data = await serviceCall(
-        service,
-        [startPlace.lng, startPlace.lat],
-        [endPlace.lng, endPlace.lat]
-      )
-
-      if (version !== routeVersion.current) return
-
-      const result = data.routes?.[0]
-      if (
-        !result
-        || !Number.isFinite(Number(result.time))
-        || !Number.isFinite(Number(result.distance))
-      ) {
-        throw new Error('高德未返回有效的路线时间。')
-      }
-
-      const path = (result.steps || []).flatMap(step => step.path || [])
-      if (!path.length) throw new Error('高德没有返回可绘制的路线。')
-
-      const routeColor = routeColors[routeLayers.current.length % routeColors.length]
-      const line = new AMap.Polyline({
-        path,
-        strokeColor: routeColor,
-        strokeWeight: 6,
-        strokeOpacity: 0.86,
-        lineJoin: 'round',
-        lineCap: 'round',
-        zIndex: 80,
-      })
-
-      const pins = [startPlace, endPlace].map((place, index) => {
-        const content = document.createElement('div')
-        content.className = 'route-pin'
-        content.style.background = routeColor
-        content.textContent = index === 0 ? 'A' : 'B'
-
-        return new AMap.Marker({
-          position: [place.lng, place.lat],
-          content,
-          anchor: 'bottom-center',
-          zIndex: 180,
-        })
-      })
-
-      const minutes = formatMinutes(result.time)
-      const badge = document.createElement('div')
-      badge.className = 'route-time-badge'
-      badge.style.borderColor = routeColor
-      badge.style.color = routeColor
-      badge.innerHTML = `
-        <strong>${mode === 'walking' ? '步行' : '驾车'} ${minutes} 分钟</strong>
-        <span>${formatDistance(result.distance)}</span>
-      `
-
-      const middlePoint = path[Math.floor(path.length / 2)]
-      const timeMarker = new AMap.Marker({
-        position: middlePoint,
-        content: badge,
-        anchor: 'center',
-        zIndex: 220,
-      })
-
-      const overlays = [line, ...pins, timeMarker]
-      mapRef.current?.add(overlays)
-      mapRef.current?.setFitView(overlays)
-
-      const routeId = crypto.randomUUID()
-      routeLayers.current.push({ id: routeId, overlays })
-
-      setRoutes(current => [
-        ...current,
-        {
-          id: routeId,
-          startId: String(startPlace.id),
-          endId: String(endPlace.id),
-          a: startPlace.name,
-          b: endPlace.name,
-          mode,
-          time: Number(result.time),
-          distance: Number(result.distance),
-          steps: result.steps || [],
-          color: routeColor,
-        },
-      ])
-    } catch (error) {
-      if (version === routeVersion.current) setRouteError(error.message)
-    } finally {
-      if (version === routeVersion.current) setRouteBusy(false)
-    }
-  }
-
-  function removeRoute(routeId) {
-    const target = routeLayers.current.find(layer => layer.id === routeId)
-    if (target) mapRef.current?.remove(target.overlays)
-
-    routeLayers.current = routeLayers.current.filter(layer => layer.id !== routeId)
-    setRoutes(current => current.filter(route => route.id !== routeId))
-  }
-
-  function removeRoutesForPlace(placeId) {
-    const id = String(placeId)
-    const relatedIds = new Set(
-      routes
-        .filter(route => route.startId === id || route.endId === id)
-        .map(route => route.id)
-    )
-
-    routeLayers.current
-      .filter(layer => relatedIds.has(layer.id))
-      .forEach(layer => mapRef.current?.remove(layer.overlays))
-
-    routeLayers.current = routeLayers.current.filter(layer => !relatedIds.has(layer.id))
-    setRoutes(current => current.filter(route => !relatedIds.has(route.id)))
-  }
-
-  function clearAllRoutes() {
-    routeVersion.current++
-    routeLayers.current.forEach(layer => mapRef.current?.remove(layer.overlays))
-    routeLayers.current = []
-    setRoutes([])
-    setRouteError('')
-    setRouteBusy(false)
-  }
-
   function deletePlace(place) {
     if (!window.confirm(`删除「${place.name}」？`)) return
 
     const id = String(place.id)
-    removeRoutesForPlace(id)
-
-    if (start === id) setStart('')
-    if (end === id) setEnd('')
-
     setItineraryOrder(current => {
       const next = {}
       Object.entries(current).forEach(([key, ids]) => {
@@ -1004,10 +1324,7 @@ function App() {
         incomingPlaces.map(normalizePlace)
       )
 
-      clearAllRoutes()
       itineraryCalcVersion.current++
-      setStart('')
-      setEnd('')
       setPlaces(converted.map(normalizePlace))
       setItineraryOrder(incomingOrder)
       setItineraryLegModes(incomingLegModes)
@@ -1070,6 +1387,8 @@ function App() {
             </div>
           )}
         </header>
+
+        {renderSyncPanel()}
 
         {mapError && <p role="alert" className="error banner">{mapError}</p>}
 
@@ -1174,7 +1493,7 @@ function App() {
               </div>
 
               <p className="hint">
-                日期、行程顺序和每段交通方式都会保存在当前浏览器，也会包含在导出的行程文件中。
+                收藏会先保存在本机；使用带分享码的链接时，也会自动同步到云端，电脑和手机共享同一份行程。
               </p>
 
               {places.map(place => (
@@ -1260,6 +1579,8 @@ function App() {
             🗺 地图
           </button>
         </header>
+
+        {renderSyncPanel()}
 
         <div className="date-tabs" aria-label="行程日期筛选">
           <button
